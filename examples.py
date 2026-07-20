@@ -209,7 +209,7 @@ def run(label, model, optimizer, xs, ys, grad_accum, total_steps, log_every,
 def main(corpus_path: str):
     device      = "cuda"
     dtype       = torch.bfloat16
-    vocab_size  = 256
+    vocab_size  = 16384
     batch_size  = 32
     seq_len     = 128
     grad_accum  = 4
@@ -291,6 +291,16 @@ def main(corpus_path: str):
         accumulator_cls=None,
     )
 
+    # ---- 7. BF16 + SR (Triton + batch_ns) -----------------------------------
+    print("\n=== 7. TritonMuonSRWithAuxAdam + TritonAccumulator + batch_ns ===")
+    model_tr_bns = copy.deepcopy(base_model)
+    optim_tr_bns = TritonMuonSRWithAuxAdam(make_param_groups(model_tr_bns), batch_ns=True)
+    losses_tr_bns, time_tr_bns, mem_tr_bns = run(
+        "SR-Tri-bns", model_tr_bns, optim_tr_bns,
+        xs, ys, grad_accum, total_steps, log_every,
+        accumulator_cls=TritonAccumulator,
+    )
+
     # ---- Summary ------------------------------------------------------------
     results = [
         ("FP32 Muon          ", losses_fp32,       time_fp32,       mem_fp32,       "(baseline)"),
@@ -299,6 +309,7 @@ def main(corpus_path: str):
         ("MuonSR  PT         ", losses_pt,         time_pt,         mem_pt,         ""),
         ("MuonSR  Tri        ", losses_tr,         time_tr,         mem_tr,         ""),
         ("MuonSR  Tri noAcc  ", losses_tr_no_acc,  time_tr_no_acc,  mem_tr_no_acc,  ""),
+        ("MuonSR  Tri batchNS", losses_tr_bns,     time_tr_bns,     mem_tr_bns,     ""),
     ]
     print("\n=== Summary ===")
     print(f"  {'Variant':<26} {'Final Loss':>10}  {'Time':>7}  {'Peak MB':>9}  {'vs FP32 loss':>13}")
@@ -308,6 +319,7 @@ def main(corpus_path: str):
         print(f"  {name:<26} {losses[-1]:>10.4f}  {elapsed:>6.1f}s  {peak_mb:>8.0f}M  {diff:>+13.4f}  {note}")
 
     print(f"\n  Triton speedup over PyTorch SR    : {time_pt / time_tr:.2f}x")
+    print(f"  batch_ns speedup over Triton SR   : {time_tr / time_tr_bns:.2f}x")
     print(f"  Accumulator overhead (Triton)     : {time_tr / time_tr_no_acc:.2f}x")
 
 

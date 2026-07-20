@@ -1,5 +1,6 @@
 import torch
 from torch.optim import Optimizer
+from collections import defaultdict
 from .stochastic_optim import copy_stochastic_
 
 
@@ -21,8 +22,33 @@ def _newton_schulz(G: torch.Tensor, steps: int = 5) -> torch.Tensor:
     return X.to(torch.float32)
 
 
+def _batched_ns(params, updates, ns_steps):
+    """
+    Group FP32 updates by 2D shape and run Newton-Schulz once per group.
+
+    params:  list of BF16 parameter tensors (shape reference only)
+    updates: list of FP32 pre-NS update tensors
+    Returns: list of FP32 post-NS update tensors reshaped to each param's original shape
+    """
+    shape_groups = defaultdict(list)
+    for i, p in enumerate(params):
+        rows = p.size(0)
+        cols = p.numel() // rows
+        shape_groups[(rows, cols)].append(i)
+
+    results = [None] * len(params)
+    for (rows, cols), indices in shape_groups.items():
+        stacked = torch.stack([updates[i].view(rows, cols) for i in indices])
+        ns_out = _newton_schulz(stacked, steps=ns_steps)
+        ns_out.mul_(max(1.0, rows / cols) ** 0.5)
+        for batch_i, orig_i in enumerate(indices):
+            results[orig_i] = ns_out[batch_i].reshape(params[orig_i].shape)
+
+    return results
+
+
 def _muon_step_fp32(grad, buf, p_fp32, beta, nesterov, ns_steps, lr, weight_decay):
-    """Shared Muon update logic (FP32). Modifies buf and p_fp32 in-place."""
+    """Single-param Muon update (FP32). Modifies buf and p_fp32 in-place."""
     buf.lerp_(grad, 1 - beta)
     update = grad.lerp_(buf, beta) if nesterov else buf.clone()
 
@@ -51,10 +77,13 @@ class MuonSR(Optimizer):
         momentum (float): momentum coefficient (default: 0.95)
         nesterov (bool): Nesterov momentum (default: True)
         ns_steps (int): Newton-Schulz iterations (default: 5)
+        batch_ns (bool): batch same-shape params into a single NS call (default: False)
     """
 
-    def __init__(self, params, lr=0.02, weight_decay=0, momentum=0.95, nesterov=True, ns_steps=5):
-        defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
+    def __init__(self, params, lr=0.02, weight_decay=0, momentum=0.95,
+                 nesterov=True, ns_steps=5, batch_ns=False):
+        defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum,
+                        nesterov=nesterov, ns_steps=ns_steps, batch_ns=batch_ns)
         super().__init__(params, defaults)
 
     def step(self, closure=None):
@@ -63,31 +92,60 @@ class MuonSR(Optimizer):
             loss = closure()
 
         for group in self.param_groups:
-            lr = group["lr"]
+            lr           = group["lr"]
             weight_decay = group["weight_decay"]
-            beta = group["momentum"]
-            nesterov = group["nesterov"]
-            ns_steps = group["ns_steps"]
+            beta         = group["momentum"]
+            nesterov     = group["nesterov"]
+            ns_steps     = group["ns_steps"]
+            batch_ns     = group["batch_ns"]
 
-            for p in group["params"]:
-                assert p.dtype == torch.bfloat16, "only bfloat16 is supported."
-                if p.grad is None:
+            if batch_ns:
+                active, bufs, p_fp32s, updates = [], [], [], []
+                for p in group["params"]:
+                    assert p.dtype == torch.bfloat16, "only bfloat16 is supported."
+                    if p.grad is None:
+                        continue
+                    if p.grad.is_sparse:
+                        raise RuntimeError("MuonSR does not support sparse gradients")
+                    state = self.state[p]
+                    if len(state) == 0:
+                        state["momentum_buffer"] = torch.zeros_like(p, dtype=torch.bfloat16)
+                    grad = p.grad.to(torch.float32)
+                    buf  = state["momentum_buffer"].to(torch.float32)
+                    buf.lerp_(grad, 1 - beta)
+                    update = grad.lerp_(buf, beta) if nesterov else buf.clone()
+                    active.append(p)
+                    bufs.append(buf)
+                    p_fp32s.append(p.clone().to(torch.float32))
+                    updates.append(update)
+
+                if not active:
                     continue
-                if p.grad.is_sparse:
-                    raise RuntimeError("MuonSR does not support sparse gradients")
 
-                state = self.state[p]
-                if len(state) == 0:
-                    state["momentum_buffer"] = torch.zeros_like(p, dtype=torch.bfloat16)
+                updates_ns = _batched_ns(active, updates, ns_steps)
+                for p, p_fp32, buf, update_ns in zip(active, p_fp32s, bufs, updates_ns):
+                    if weight_decay != 0:
+                        p_fp32.mul_(1 - lr * weight_decay)
+                    p_fp32.add_(update_ns, alpha=-lr)
+                    copy_stochastic_(self.state[p]["momentum_buffer"], buf)
+                    copy_stochastic_(p, p_fp32)
 
-                grad = p.grad.to(torch.float32)
-                p_fp32 = p.clone().to(torch.float32)
-                buf = state["momentum_buffer"].to(torch.float32)
-
-                _muon_step_fp32(grad, buf, p_fp32, beta, nesterov, ns_steps, lr, weight_decay)
-
-                copy_stochastic_(state["momentum_buffer"], buf)
-                copy_stochastic_(p, p_fp32)
+            else:
+                for p in group["params"]:
+                    assert p.dtype == torch.bfloat16, "only bfloat16 is supported."
+                    if p.grad is None:
+                        continue
+                    if p.grad.is_sparse:
+                        raise RuntimeError("MuonSR does not support sparse gradients")
+                    state = self.state[p]
+                    if len(state) == 0:
+                        state["momentum_buffer"] = torch.zeros_like(p, dtype=torch.bfloat16)
+                    grad   = p.grad.to(torch.float32)
+                    p_fp32 = p.clone().to(torch.float32)
+                    buf    = state["momentum_buffer"].to(torch.float32)
+                    _muon_step_fp32(grad, buf, p_fp32, beta, nesterov, ns_steps, lr, weight_decay)
+                    copy_stochastic_(state["momentum_buffer"], buf)
+                    copy_stochastic_(p, p_fp32)
 
         return loss
 
@@ -111,10 +169,10 @@ class MuonSRWithAuxAdam(Optimizer):
             dict(params=embed_params,  lr=0.6,   betas=(0.8, 0.95), eps=1e-10, weight_decay=0, use_muon=False),
             dict(params=scalar_params, lr=0.04,  betas=(0.8, 0.95), eps=1e-10, weight_decay=0, use_muon=False),
         ]
-        optimizer = MuonSRWithAuxAdam(param_groups)
+        optimizer = MuonSRWithAuxAdam(param_groups, batch_ns=True)
     """
 
-    def __init__(self, param_groups):
+    def __init__(self, param_groups, batch_ns=False):
         for group in param_groups:
             assert "use_muon" in group
             if group["use_muon"]:
@@ -128,6 +186,7 @@ class MuonSRWithAuxAdam(Optimizer):
                 group.setdefault("betas", (0.9, 0.95))
                 group.setdefault("eps", 1e-10)
                 group.setdefault("weight_decay", 0)
+        self.batch_ns = batch_ns
         super().__init__(param_groups, {})
 
     def step(self, closure=None):
@@ -137,36 +196,62 @@ class MuonSRWithAuxAdam(Optimizer):
 
         for group in self.param_groups:
             if group["use_muon"]:
-                lr = group["lr"]
+                lr           = group["lr"]
                 weight_decay = group["weight_decay"]
-                beta = group["momentum"]
-                nesterov = group["nesterov"]
-                ns_steps = group["ns_steps"]
+                beta         = group["momentum"]
+                nesterov     = group["nesterov"]
+                ns_steps     = group["ns_steps"]
 
-                for p in group["params"]:
-                    assert p.dtype == torch.bfloat16, "only bfloat16 is supported."
-                    if p.grad is None:
-                        continue
-                    if p.grad.is_sparse:
-                        raise RuntimeError("MuonSRWithAuxAdam does not support sparse gradients")
+                if self.batch_ns:
+                    active, bufs, p_fp32s, updates = [], [], [], []
+                    for p in group["params"]:
+                        assert p.dtype == torch.bfloat16, "only bfloat16 is supported."
+                        if p.grad is None:
+                            continue
+                        if p.grad.is_sparse:
+                            raise RuntimeError("MuonSRWithAuxAdam does not support sparse gradients")
+                        state = self.state[p]
+                        if len(state) == 0:
+                            state["momentum_buffer"] = torch.zeros_like(p, dtype=torch.bfloat16)
+                        grad = p.grad.to(torch.float32)
+                        buf  = state["momentum_buffer"].to(torch.float32)
+                        buf.lerp_(grad, 1 - beta)
+                        update = grad.lerp_(buf, beta) if nesterov else buf.clone()
+                        active.append(p)
+                        bufs.append(buf)
+                        p_fp32s.append(p.clone().to(torch.float32))
+                        updates.append(update)
 
-                    state = self.state[p]
-                    if len(state) == 0:
-                        state["momentum_buffer"] = torch.zeros_like(p, dtype=torch.bfloat16)
+                    if active:
+                        updates_ns = _batched_ns(active, updates, ns_steps)
+                        for p, p_fp32, buf, update_ns in zip(active, p_fp32s, bufs, updates_ns):
+                            if weight_decay != 0:
+                                p_fp32.mul_(1 - lr * weight_decay)
+                            p_fp32.add_(update_ns, alpha=-lr)
+                            copy_stochastic_(self.state[p]["momentum_buffer"], buf)
+                            copy_stochastic_(p, p_fp32)
 
-                    grad = p.grad.to(torch.float32)
-                    p_fp32 = p.clone().to(torch.float32)
-                    buf = state["momentum_buffer"].to(torch.float32)
-
-                    _muon_step_fp32(grad, buf, p_fp32, beta, nesterov, ns_steps, lr, weight_decay)
-
-                    copy_stochastic_(state["momentum_buffer"], buf)
-                    copy_stochastic_(p, p_fp32)
+                else:
+                    for p in group["params"]:
+                        assert p.dtype == torch.bfloat16, "only bfloat16 is supported."
+                        if p.grad is None:
+                            continue
+                        if p.grad.is_sparse:
+                            raise RuntimeError("MuonSRWithAuxAdam does not support sparse gradients")
+                        state = self.state[p]
+                        if len(state) == 0:
+                            state["momentum_buffer"] = torch.zeros_like(p, dtype=torch.bfloat16)
+                        grad   = p.grad.to(torch.float32)
+                        p_fp32 = p.clone().to(torch.float32)
+                        buf    = state["momentum_buffer"].to(torch.float32)
+                        _muon_step_fp32(grad, buf, p_fp32, beta, nesterov, ns_steps, lr, weight_decay)
+                        copy_stochastic_(state["momentum_buffer"], buf)
+                        copy_stochastic_(p, p_fp32)
 
             else:
-                lr = group["lr"]
+                lr           = group["lr"]
                 beta1, beta2 = group["betas"]
-                eps = group["eps"]
+                eps          = group["eps"]
                 weight_decay = group["weight_decay"]
 
                 for p in group["params"]:
@@ -175,31 +260,25 @@ class MuonSRWithAuxAdam(Optimizer):
                         continue
                     if p.grad.is_sparse:
                         raise RuntimeError("MuonSRWithAuxAdam does not support sparse gradients")
-
                     state = self.state[p]
                     if len(state) == 0:
                         state["step"] = 0
                         state["ema"] = torch.zeros_like(p, dtype=torch.bfloat16)
                         state["ema_squared"] = torch.zeros_like(p, dtype=torch.bfloat16)
-
                     state["step"] += 1
-                    grad = p.grad.to(torch.float32)
+                    grad   = p.grad.to(torch.float32)
                     p_fp32 = p.clone().to(torch.float32)
-                    ema = state["ema"].to(torch.float32)
+                    ema    = state["ema"].to(torch.float32)
                     ema_sq = state["ema_squared"].to(torch.float32)
-
-                    bias_correction = 1 - beta1 ** state["step"]
+                    bias_correction      = 1 - beta1 ** state["step"]
                     bias_correction_sqrt = (1 - beta2 ** state["step"]) ** 0.5
                     step_size = lr / bias_correction
-
                     ema.mul_(beta1).add_(grad, alpha=1 - beta1)
                     ema_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
                     denom = (ema_sq.sqrt() / bias_correction_sqrt).add_(eps)
-
                     if weight_decay != 0:
                         p_fp32.mul_(1 - lr * weight_decay)
                     p_fp32.addcdiv_(ema, denom, value=-step_size)
-
                     copy_stochastic_(state["ema"], ema)
                     copy_stochastic_(state["ema_squared"], ema_sq)
                     copy_stochastic_(p, p_fp32)

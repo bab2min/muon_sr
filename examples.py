@@ -19,9 +19,9 @@ import torch.nn.functional as F
 
 from muon import SingleDeviceMuonWithAuxAdam
 from muon_sr import (
-    StochasticAccumulator,
+    SRAccumulator,
     MuonSRWithAuxAdam,
-    TritonAccumulator,
+    TritonSRAccumulator,
     TritonMuonSRWithAuxAdam,
 )
 
@@ -213,7 +213,7 @@ def main(corpus_path: str):
     batch_size  = 32
     seq_len     = 128
     grad_accum  = 4
-    total_steps = 1000
+    total_steps = 500
     log_every   = 20
     seed        = 42
 
@@ -233,83 +233,86 @@ def main(corpus_path: str):
             p_dst.data.copy_(p_src.data.float())
         return m
 
+    def run_and_free(label, model, optimizer, accumulator_cls=None, autocast=False):
+        """Run training and immediately free model/optimizer to keep peak memory isolated."""
+        losses, elapsed, peak_mb = run(
+            label, model, optimizer,
+            xs, ys, grad_accum, total_steps, log_every,
+            accumulator_cls=accumulator_cls, autocast=autocast,
+        )
+        del model, optimizer
+        torch.cuda.empty_cache()
+        return losses, elapsed, peak_mb
+
     # ---- 1. FP32 baseline ---------------------------------------------------
     print("=== 1. FP32 SingleDeviceMuon (no quantization, baseline) ===")
-    model_fp32 = fp32_model()
-    optim_fp32 = SingleDeviceMuonWithAuxAdam(make_param_groups(model_fp32))
-    losses_fp32, time_fp32, mem_fp32 = run(
-        "FP32   ", model_fp32, optim_fp32,
-        xs, ys, grad_accum, total_steps, log_every,
+    _m = fp32_model()
+    losses_fp32, time_fp32, mem_fp32 = run_and_free(
+        "FP32   ", _m, SingleDeviceMuonWithAuxAdam(make_param_groups(_m)),
     )
 
     # ---- 2. AMP BF16 (FP32 params + BF16 forward) --------------------------
     print("\n=== 2. AMP BF16 SingleDeviceMuon (FP32 params + BF16 autocast) ===")
-    model_amp = fp32_model()
-    optim_amp = SingleDeviceMuonWithAuxAdam(make_param_groups(model_amp))
-    losses_amp, time_amp, mem_amp = run(
-        "AMP    ", model_amp, optim_amp,
-        xs, ys, grad_accum, total_steps, log_every,
-        autocast=True,
+    _m = fp32_model()
+    losses_amp, time_amp, mem_amp = run_and_free(
+        "AMP    ", _m, SingleDeviceMuonWithAuxAdam(make_param_groups(_m)), autocast=True,
     )
 
     # ---- 3. Pure BF16 naive (round-to-nearest) ------------------------------
     print("\n=== 3. BF16 SingleDeviceMuon (round-to-nearest, no stochastic rounding) ===")
-    model_naive = copy.deepcopy(base_model)
-    optim_naive = SingleDeviceMuonWithAuxAdam(make_param_groups(model_naive))
-    losses_naive, time_naive, mem_naive = run(
-        "Naive  ", model_naive, optim_naive,
-        xs, ys, grad_accum, total_steps, log_every,
+    _m = copy.deepcopy(base_model)
+    losses_naive, time_naive, mem_naive = run_and_free(
+        "Naive  ", _m, SingleDeviceMuonWithAuxAdam(make_param_groups(_m)),
     )
 
     # ---- 4. BF16 + SR (PyTorch) ---------------------------------------------
     print("\n=== 4. MuonSRWithAuxAdam (PyTorch + SR) ===")
-    model_pt = copy.deepcopy(base_model)
-    optim_pt = MuonSRWithAuxAdam(make_param_groups(model_pt))
-    losses_pt, time_pt, mem_pt = run(
-        "SR-PT  ", model_pt, optim_pt,
-        xs, ys, grad_accum, total_steps, log_every,
-        accumulator_cls=StochasticAccumulator,
+    _m = copy.deepcopy(base_model)
+    losses_pt, time_pt, mem_pt = run_and_free(
+        "SR-PT  ", _m, MuonSRWithAuxAdam(make_param_groups(_m)),
+        accumulator_cls=SRAccumulator,
     )
 
-    # ---- 5. BF16 + SR (Triton + TritonAccumulator) --------------------------
-    print("\n=== 5. TritonMuonSRWithAuxAdam + TritonAccumulator ===")
-    model_tr = copy.deepcopy(base_model)
-    optim_tr = TritonMuonSRWithAuxAdam(make_param_groups(model_tr))
-    losses_tr, time_tr, mem_tr = run(
-        "SR-Tri ", model_tr, optim_tr,
-        xs, ys, grad_accum, total_steps, log_every,
-        accumulator_cls=TritonAccumulator,
+    # ---- 5. BF16 + SR (Triton + TritonSRAccumulator) --------------------------
+    print("\n=== 5. TritonMuonSRWithAuxAdam + TritonSRAccumulator ===")
+    _m = copy.deepcopy(base_model)
+    losses_tr, time_tr, mem_tr = run_and_free(
+        "SR-Tri ", _m, TritonMuonSRWithAuxAdam(make_param_groups(_m)),
+        accumulator_cls=TritonSRAccumulator,
     )
 
     # ---- 6. BF16 + SR (Triton only, no accumulator) -------------------------
     print("\n=== 6. TritonMuonSRWithAuxAdam (no accumulator) ===")
-    model_tr_no_acc = copy.deepcopy(base_model)
-    optim_tr_no_acc = TritonMuonSRWithAuxAdam(make_param_groups(model_tr_no_acc))
-    losses_tr_no_acc, time_tr_no_acc, mem_tr_no_acc = run(
-        "SR-Tri-noAcc", model_tr_no_acc, optim_tr_no_acc,
-        xs, ys, grad_accum, total_steps, log_every,
-        accumulator_cls=None,
+    _m = copy.deepcopy(base_model)
+    losses_tr_no_acc, time_tr_no_acc, mem_tr_no_acc = run_and_free(
+        "SR-Tri-noAcc", _m, TritonMuonSRWithAuxAdam(make_param_groups(_m)),
     )
 
-    # ---- 7. BF16 + SR (Triton + batch_ns) -----------------------------------
+    # ---- 7. BF16 + SR (Triton + TritonAccumulator + batch_ns) --------------
     print("\n=== 7. TritonMuonSRWithAuxAdam + TritonAccumulator + batch_ns ===")
-    model_tr_bns = copy.deepcopy(base_model)
-    optim_tr_bns = TritonMuonSRWithAuxAdam(make_param_groups(model_tr_bns), batch_ns=True)
-    losses_tr_bns, time_tr_bns, mem_tr_bns = run(
-        "SR-Tri-bns", model_tr_bns, optim_tr_bns,
-        xs, ys, grad_accum, total_steps, log_every,
-        accumulator_cls=TritonAccumulator,
+    _m = copy.deepcopy(base_model)
+    losses_tr_bns, time_tr_bns, mem_tr_bns = run_and_free(
+        "SR-Tri-bns", _m, TritonMuonSRWithAuxAdam(make_param_groups(_m), batch_ns=True),
+        accumulator_cls=TritonSRAccumulator,
+    )
+
+    # ---- 8. BF16 + SR (Triton + no accumulator + batch_ns) ------------------
+    print("\n=== 8. TritonMuonSRWithAuxAdam (no accumulator + batch_ns) ===")
+    _m = copy.deepcopy(base_model)
+    losses_tr_bns_no_acc, time_tr_bns_no_acc, mem_tr_bns_no_acc = run_and_free(
+        "SR-Tri-bns-noAcc", _m, TritonMuonSRWithAuxAdam(make_param_groups(_m), batch_ns=True),
     )
 
     # ---- Summary ------------------------------------------------------------
     results = [
-        ("FP32 Muon          ", losses_fp32,       time_fp32,       mem_fp32,       "(baseline)"),
-        ("AMP BF16 Muon      ", losses_amp,        time_amp,        mem_amp,        ""),
-        ("NaiveBF16 Muon     ", losses_naive,      time_naive,      mem_naive,      ""),
-        ("MuonSR  PT         ", losses_pt,         time_pt,         mem_pt,         ""),
-        ("MuonSR  Tri        ", losses_tr,         time_tr,         mem_tr,         ""),
-        ("MuonSR  Tri noAcc  ", losses_tr_no_acc,  time_tr_no_acc,  mem_tr_no_acc,  ""),
-        ("MuonSR  Tri batchNS", losses_tr_bns,     time_tr_bns,     mem_tr_bns,     ""),
+        ("FP32 Muon              ", losses_fp32,           time_fp32,           mem_fp32,           "(baseline)"),
+        ("AMP BF16 Muon          ", losses_amp,            time_amp,            mem_amp,            ""),
+        ("NaiveBF16 Muon         ", losses_naive,          time_naive,          mem_naive,          ""),
+        ("MuonSR  PT             ", losses_pt,             time_pt,             mem_pt,             ""),
+        ("MuonSR  Tri            ", losses_tr,             time_tr,             mem_tr,             ""),
+        ("MuonSR  Tri noAcc      ", losses_tr_no_acc,      time_tr_no_acc,      mem_tr_no_acc,      ""),
+        ("MuonSR  Tri batchNS    ", losses_tr_bns,         time_tr_bns,         mem_tr_bns,         ""),
+        ("MuonSR  Tri batchNS noA", losses_tr_bns_no_acc,  time_tr_bns_no_acc,  mem_tr_bns_no_acc,  ""),
     ]
     print("\n=== Summary ===")
     print(f"  {'Variant':<26} {'Final Loss':>10}  {'Time':>7}  {'Peak MB':>9}  {'vs FP32 loss':>13}")
@@ -318,9 +321,10 @@ def main(corpus_path: str):
         diff = abs(losses[-1] - losses_fp32[-1])
         print(f"  {name:<26} {losses[-1]:>10.4f}  {elapsed:>6.1f}s  {peak_mb:>8.0f}M  {diff:>+13.4f}  {note}")
 
-    print(f"\n  Triton speedup over PyTorch SR    : {time_pt / time_tr:.2f}x")
-    print(f"  batch_ns speedup over Triton SR   : {time_tr / time_tr_bns:.2f}x")
-    print(f"  Accumulator overhead (Triton)     : {time_tr / time_tr_no_acc:.2f}x")
+    print(f"\n  Triton speedup over PyTorch SR       : {time_pt / time_tr:.2f}x")
+    print(f"  batch_ns speedup over Triton SR      : {time_tr / time_tr_bns:.2f}x")
+    print(f"  batch_ns+noAcc speedup over Triton SR: {time_tr / time_tr_bns_no_acc:.2f}x")
+    print(f"  Accumulator overhead (Triton)        : {time_tr / time_tr_no_acc:.2f}x")
 
 
 if __name__ == "__main__":

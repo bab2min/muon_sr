@@ -1,11 +1,10 @@
-from .stochastic_optim import StochasticAccumulator
-from .triton_adamw import TritonAdamW, TritonAccumulator
-from .muon_sr import MuonSR, MuonSRWithAuxAdam
+from .triton_adamw import TritonAdamW, TritonSRAccumulator
+from .muon_sr import MuonSR, MuonSRWithAuxAdam, SRAccumulator
 from .triton_muon_sr import TritonMuonSR, TritonMuonSRWithAuxAdam
 
 __all__ = [
-    "StochasticAccumulator",
-    "TritonAdamW", "TritonAccumulator",
+    "SRAccumulator",
+    "TritonAdamW", "TritonSRAccumulator",
     "MuonSR", "MuonSRWithAuxAdam",
     "TritonMuonSR", "TritonMuonSRWithAuxAdam",
 ]

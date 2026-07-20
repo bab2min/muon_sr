@@ -223,22 +223,22 @@ def _grad_accum_kernel(
     tl.store(acc_ptr + offsets, acc_rounded.to(tl.bfloat16), mask=mask)
 
 
-class TritonAccumulator:
+class TritonSRAccumulator:
     """
-    Drop-in replacement for StochasticAccumulator using a fused Triton kernel.
+    Drop-in replacement for SRAccumulator using a fused Triton kernel.
 
     Fuses: BF16 load(acc) + FP32 load(grad) → FP32 add → stochastic round → BF16 store
     into a single kernel launch per parameter per microbatch, eliminating temporary tensors.
 
-    Usage is identical to StochasticAccumulator:
+    Usage is identical to SRAccumulator:
 
-        TritonAccumulator.assign_hooks(model)
+        TritonSRAccumulator.assign_hooks(model)
 
         for step in range(total_steps):
             for _ in range(grad_accum):
                 loss = model(x)
                 loss.backward()
-            TritonAccumulator.reassign_grad_buffer(model)
+            TritonSRAccumulator.reassign_grad_buffer(model)
             optimizer.step()
             optimizer.zero_grad()
     """
@@ -270,5 +270,5 @@ class TritonAccumulator:
         hooks = []
         for _, p in model.named_parameters():
             if p.requires_grad:
-                hooks.append(p.register_post_accumulate_grad_hook(TritonAccumulator._accum_hook))
+                hooks.append(p.register_post_accumulate_grad_hook(TritonSRAccumulator._accum_hook))
         return hooks

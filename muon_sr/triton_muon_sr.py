@@ -1,5 +1,4 @@
 import random
-from collections import defaultdict
 
 import torch
 from torch.optim import Optimizer
@@ -7,7 +6,7 @@ from torch.optim import Optimizer
 import triton
 import triton.language as tl
 
-from .muon_sr import _newton_schulz, _batched_ns
+from .muon_sr import _newton_schulz, _init_stacked_bufs
 from .triton_adamw import _adamw_step
 
 
@@ -98,25 +97,58 @@ def _run_apply(p, update_ns, lr, weight_decay):
 def _triton_muon_step(p, grad, buf, beta, nesterov, ns_steps, lr, weight_decay):
     """Single-param Triton Muon step (no batching)."""
     update = _run_prepare(p, grad, buf, beta, nesterov)
-    update_2d = update.view(p.size(0), -1) if p.ndim > 2 else update.view(p.shape)
-    update_ns = _newton_schulz(update_2d, steps=ns_steps)
+    update_ns = _newton_schulz(update.view(p.shape), steps=ns_steps)
     update_ns.mul_(max(1.0, update_ns.size(-2) / update_ns.size(-1)) ** 0.5)
-    _run_apply(p, update_ns.reshape(p.shape), lr, weight_decay)
+    _run_apply(p, update_ns, lr, weight_decay)
 
 
-def _triton_muon_group_step(params, grads, bufs, beta, nesterov, ns_steps, lr, weight_decay):
+def _triton_muon_batch_step(shape_groups, stacked_bufs, buf_indices,
+                            beta, nesterov, ns_steps, lr, weight_decay):
     """
-    Batched Triton Muon step: same-shape params share a single prepare + NS + apply.
+    Batched Triton Muon step using pre-allocated stacked BF16 momentum buffers.
+    FP32 workspace is allocated transiently per shape group and freed after use.
 
-    Phase 1 (Triton): prepare each param — individual kernel launches
-    Phase 2 (PyTorch): _batched_ns groups by shape — one NS call per unique shape
-    Phase 3 (Triton): apply each param — individual kernel launches
+    Phase 1 (Triton): prepare on the full stacked buf/grad — 1 kernel launch per unique shape
+    Phase 2 (PyTorch): Newton-Schulz on stacked update    — 1 NS call per unique shape
+    Phase 3 (Triton): apply on stacked params             — 1 kernel launch per unique shape
     """
-    updates = [_run_prepare(p, g, buf, beta, nesterov)
-               for p, g, buf in zip(params, grads, bufs)]
-    updates_ns = _batched_ns(params, updates, ns_steps)
-    for p, update_ns in zip(params, updates_ns):
-        _run_apply(p, update_ns, lr, weight_decay)
+    BLOCK_SIZE = 1024
+    for shape, grp_params in shape_groups.items():
+        active = [p for p in grp_params if p.grad is not None]
+        if not active:
+            continue
+
+        stacked_buf = stacked_bufs[shape]   # BF16 [N, *shape]
+        Na          = len(active)
+        all_active  = Na == len(grp_params)
+
+        if all_active:
+            # Transient FP32 workspace — allocated here, freed at end of block
+            work = torch.empty(Na, *shape, dtype=torch.float32, device=active[0].device)
+            for p in active:
+                work[buf_indices[id(p)]].copy_(p.grad)
+
+            n = stacked_buf.numel()
+            # Phase 1: prepare entire stack in one kernel
+            _muon_prepare_kernel[(triton.cdiv(n, BLOCK_SIZE),)](
+                work.view(-1), stacked_buf.view(-1), work.view(-1),
+                beta, nesterov, n, random.getrandbits(32), BLOCK_SIZE=BLOCK_SIZE,
+            )
+
+            # Phase 2: NS operates on last two dims — pass stacked tensor directly
+            update_ns = _newton_schulz(work, steps=ns_steps)
+            rows, cols = work.size(-2), work.size(-1)
+            update_ns.mul_(max(1.0, rows / cols) ** 0.5)
+            del work  # free FP32 workspace before phase 3
+
+            # Phase 3: apply per-param using update_ns[i] views — no extra allocation
+            for p in active:
+                _run_apply(p, update_ns[buf_indices[id(p)]], lr, weight_decay)
+
+        else:
+            for p in active:
+                _triton_muon_step(p, p.grad, stacked_bufs[shape][buf_indices[id(p)]],
+                                  beta, nesterov, ns_steps, lr, weight_decay)
 
 
 class TritonMuonSR(Optimizer):
@@ -133,7 +165,7 @@ class TritonMuonSR(Optimizer):
         momentum (float): momentum coefficient (default: 0.95)
         nesterov (bool): Nesterov momentum (default: True)
         ns_steps (int): Newton-Schulz iterations (default: 5)
-        batch_ns (bool): group same-shape params into a single NS call (default: False)
+        batch_ns (bool): pre-allocate stacked buffers and batch NS by shape (default: False)
     """
 
     def __init__(self, params, lr=0.02, weight_decay=0, momentum=0.95,
@@ -141,6 +173,7 @@ class TritonMuonSR(Optimizer):
         defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum,
                         nesterov=nesterov, ns_steps=ns_steps, batch_ns=batch_ns)
         super().__init__(params, defaults)
+        self._batch_state = {}
 
     def step(self, closure=None):
         loss = None
@@ -153,27 +186,21 @@ class TritonMuonSR(Optimizer):
             beta         = group["momentum"]
             nesterov     = group["nesterov"]
             ns_steps     = group["ns_steps"]
-            batch_ns     = group["batch_ns"]
 
-            if batch_ns:
-                active, grads, bufs = [], [], []
+            if group["batch_ns"]:
+                gid = id(group)
+                if gid not in self._batch_state:
+                    device = group["params"][0].device
+                    self._batch_state[gid] = _init_stacked_bufs(group["params"], device)
+                shape_groups, stacked_bufs, buf_indices = self._batch_state[gid]
+
                 for p in group["params"]:
                     assert p.dtype == torch.bfloat16, "only bfloat16 is supported."
-                    if p.grad is None:
-                        continue
-                    if p.grad.is_sparse:
+                    if p.grad is not None and p.grad.is_sparse:
                         raise RuntimeError("TritonMuonSR does not support sparse gradients")
-                    state = self.state[p]
-                    if len(state) == 0:
-                        state["step"] = 0
-                        state["momentum_buffer"] = torch.zeros_like(p, dtype=torch.bfloat16)
-                    state["step"] += 1
-                    active.append(p)
-                    grads.append(p.grad)
-                    bufs.append(state["momentum_buffer"])
 
-                if active:
-                    _triton_muon_group_step(active, grads, bufs, beta, nesterov, ns_steps, lr, weight_decay)
+                _triton_muon_batch_step(shape_groups, stacked_bufs, buf_indices,
+                                        beta, nesterov, ns_steps, lr, weight_decay)
 
             else:
                 for p in group["params"]:
@@ -200,18 +227,11 @@ class TritonMuonSRWithAuxAdam(Optimizer):
     Handles both Muon params (use_muon=True) and AdamW params (use_muon=False) in a single
     optimizer, matching the original SingleDeviceMuonWithAuxAdam interface exactly.
 
-    Usage:
-        hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2]
-        embed_params = [p for n, p in model.named_parameters() if "embed" in n]
-        scalar_params = [p for p in model.parameters() if p.ndim < 2]
-        head_params = [model.lm_head.weight]
+    Arguments:
+        param_groups: list of param group dicts with 'use_muon' flag
+        batch_ns (bool): pre-allocate stacked buffers and batch NS by shape (default: False)
 
-        param_groups = [
-            dict(params=hidden_matrix_params, lr=0.02, momentum=0.95, weight_decay=0.01, use_muon=True),
-            dict(params=head_params,   lr=0.22,  betas=(0.8, 0.95), eps=1e-10, weight_decay=0, use_muon=False),
-            dict(params=embed_params,  lr=0.6,   betas=(0.8, 0.95), eps=1e-10, weight_decay=0, use_muon=False),
-            dict(params=scalar_params, lr=0.04,  betas=(0.8, 0.95), eps=1e-10, weight_decay=0, use_muon=False),
-        ]
+    Usage:
         optimizer = TritonMuonSRWithAuxAdam(param_groups, batch_ns=True)
     """
 
@@ -230,6 +250,7 @@ class TritonMuonSRWithAuxAdam(Optimizer):
                 group.setdefault("eps", 1e-10)
                 group.setdefault("weight_decay", 0)
         self.batch_ns = batch_ns
+        self._batch_state = {}
         super().__init__(param_groups, {})
 
     def step(self, closure=None):
@@ -246,24 +267,19 @@ class TritonMuonSRWithAuxAdam(Optimizer):
                 ns_steps     = group["ns_steps"]
 
                 if self.batch_ns:
-                    active, grads, bufs = [], [], []
+                    gid = id(group)
+                    if gid not in self._batch_state:
+                        device = group["params"][0].device
+                        self._batch_state[gid] = _init_stacked_bufs(group["params"], device)
+                    shape_groups, stacked_bufs, buf_indices = self._batch_state[gid]
+
                     for p in group["params"]:
                         assert p.dtype == torch.bfloat16, "only bfloat16 is supported."
-                        if p.grad is None:
-                            continue
-                        if p.grad.is_sparse:
+                        if p.grad is not None and p.grad.is_sparse:
                             raise RuntimeError("TritonMuonSRWithAuxAdam does not support sparse gradients")
-                        state = self.state[p]
-                        if len(state) == 0:
-                            state["step"] = 0
-                            state["momentum_buffer"] = torch.zeros_like(p, dtype=torch.bfloat16)
-                        state["step"] += 1
-                        active.append(p)
-                        grads.append(p.grad)
-                        bufs.append(state["momentum_buffer"])
 
-                    if active:
-                        _triton_muon_group_step(active, grads, bufs, beta, nesterov, ns_steps, lr, weight_decay)
+                    _triton_muon_batch_step(shape_groups, stacked_bufs, buf_indices,
+                                            beta, nesterov, ns_steps, lr, weight_decay)
 
                 else:
                     for p in group["params"]:

@@ -1,3 +1,5 @@
+from ._version import __version__
+
 from .triton_adamw import TritonAdamW, TritonSRAccumulator
 from .muon_sr import MuonSR, MuonSRWithAuxAdam, SRAccumulator
 from .triton_muon_sr import TritonMuonSR, TritonMuonSRWithAuxAdam

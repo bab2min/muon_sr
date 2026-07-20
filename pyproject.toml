@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "muon_sr"
+dynamic = ["version"]
+description = "A small utility for sr written in python"
+readme = "README.md"
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "torch",
+    "triton",
+]
+
+[tool.setuptools.dynamic]
+version = {attr = "muon_sr._version.__version__"}

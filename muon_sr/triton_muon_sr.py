@@ -266,35 +266,36 @@ class TritonMuonSRWithAuxAdam(Optimizer):
                 nesterov     = group["nesterov"]
                 ns_steps     = group["ns_steps"]
 
-                if self.batch_ns:
-                    gid = id(group)
-                    if gid not in self._batch_state:
-                        device = group["params"][0].device
-                        self._batch_state[gid] = _init_stacked_bufs(group["params"], device)
-                    shape_groups, stacked_bufs, buf_indices = self._batch_state[gid]
+                if group["params"]:
+                    if self.batch_ns:
+                        gid = id(group)
+                        if gid not in self._batch_state:
+                            device = group["params"][0].device
+                            self._batch_state[gid] = _init_stacked_bufs(group["params"], device)
+                        shape_groups, stacked_bufs, buf_indices = self._batch_state[gid]
 
-                    for p in group["params"]:
-                        assert p.dtype == torch.bfloat16, "only bfloat16 is supported."
-                        if p.grad is not None and p.grad.is_sparse:
-                            raise RuntimeError("TritonMuonSRWithAuxAdam does not support sparse gradients")
+                        for p in group["params"]:
+                            assert p.dtype == torch.bfloat16, "only bfloat16 is supported."
+                            if p.grad is not None and p.grad.is_sparse:
+                                raise RuntimeError("TritonMuonSRWithAuxAdam does not support sparse gradients")
 
-                    _triton_muon_batch_step(shape_groups, stacked_bufs, buf_indices,
-                                            beta, nesterov, ns_steps, lr, weight_decay)
+                        _triton_muon_batch_step(shape_groups, stacked_bufs, buf_indices,
+                                                beta, nesterov, ns_steps, lr, weight_decay)
 
-                else:
-                    for p in group["params"]:
-                        assert p.dtype == torch.bfloat16, "only bfloat16 is supported."
-                        if p.grad is None:
-                            continue
-                        if p.grad.is_sparse:
-                            raise RuntimeError("TritonMuonSRWithAuxAdam does not support sparse gradients")
-                        state = self.state[p]
-                        if len(state) == 0:
-                            state["step"] = 0
-                            state["momentum_buffer"] = torch.zeros_like(p, dtype=torch.bfloat16)
-                        state["step"] += 1
-                        _triton_muon_step(p, p.grad, state["momentum_buffer"],
-                                          beta, nesterov, ns_steps, lr, weight_decay)
+                    else:
+                        for p in group["params"]:
+                            assert p.dtype == torch.bfloat16, "only bfloat16 is supported."
+                            if p.grad is None:
+                                continue
+                            if p.grad.is_sparse:
+                                raise RuntimeError("TritonMuonSRWithAuxAdam does not support sparse gradients")
+                            state = self.state[p]
+                            if len(state) == 0:
+                                state["step"] = 0
+                                state["momentum_buffer"] = torch.zeros_like(p, dtype=torch.bfloat16)
+                            state["step"] += 1
+                            _triton_muon_step(p, p.grad, state["momentum_buffer"],
+                                              beta, nesterov, ns_steps, lr, weight_decay)
 
             else:
                 lr           = group["lr"]

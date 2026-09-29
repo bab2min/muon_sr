@@ -6,8 +6,13 @@ from torch.optim import Optimizer
 import triton
 import triton.language as tl
 
-from .muon_sr import _newton_schulz, _init_stacked_bufs
+from .muon_sr import _newton_schulz, _init_stacked_bufs, _StackedBufsMixin
 from .triton_adamw import _adamw_step
+
+
+def _restore_global_step(state, groups):
+    """Recover `_global_step` of batch_ns groups from the per-param steps recorded in `state`."""
+    return max((state[p].get("step", 0) for g in groups for p in g["params"]), default=0)
 
 
 @triton.jit
@@ -158,7 +163,7 @@ def _triton_muon_batch_step(shape_groups, stacked_bufs, buf_indices,
                                   beta, nesterov, ns_steps, lr, weight_decay, step, param_idx)
 
 
-class TritonMuonSR(Optimizer):
+class TritonMuonSR(_StackedBufsMixin, Optimizer):
     r"""
     Drop-in replacement for SingleDeviceMuon with fused Triton kernels and BF16 stochastic rounding.
 
@@ -198,7 +203,7 @@ class TritonMuonSR(Optimizer):
                 gid = id(group)
                 if gid not in self._batch_state:
                     device = group["params"][0].device
-                    self._batch_state[gid] = _init_stacked_bufs(group["params"], device)
+                    self._batch_state[gid] = _init_stacked_bufs(group["params"], device, self.state)
                 shape_groups, stacked_bufs, buf_indices = self._batch_state[gid]
 
                 for p in group["params"]:
@@ -207,8 +212,12 @@ class TritonMuonSR(Optimizer):
                         raise RuntimeError("TritonMuonSR does not support sparse gradients")
 
                 if not hasattr(self, '_global_step'):
-                    self._global_step = 0
+                    self._global_step = _restore_global_step(
+                        self.state, [g for g in self.param_groups if g["batch_ns"]])
                 self._global_step += 1
+                # Recorded per param so that the SR seeds continue after load_state_dict().
+                for p in group["params"]:
+                    self.state[p]["step"] = self._global_step
                 _triton_muon_batch_step(shape_groups, stacked_bufs, buf_indices,
                                         beta, nesterov, ns_steps, lr, weight_decay,
                                         self._global_step)
@@ -232,7 +241,7 @@ class TritonMuonSR(Optimizer):
         return loss
 
 
-class TritonMuonSRWithAuxAdam(Optimizer):
+class TritonMuonSRWithAuxAdam(_StackedBufsMixin, Optimizer):
     r"""
     Drop-in replacement for SingleDeviceMuonWithAuxAdam with fused Triton kernels and BF16 stochastic rounding.
 
@@ -270,7 +279,10 @@ class TritonMuonSRWithAuxAdam(Optimizer):
         if closure is not None:
             loss = closure()
 
+        param_offset = 0
         for group in self.param_groups:
+            group_offset = param_offset
+            param_offset += len(group["params"])
             if group["use_muon"]:
                 lr           = group["lr"]
                 weight_decay = group["weight_decay"]
@@ -283,7 +295,7 @@ class TritonMuonSRWithAuxAdam(Optimizer):
                         gid = id(group)
                         if gid not in self._batch_state:
                             device = group["params"][0].device
-                            self._batch_state[gid] = _init_stacked_bufs(group["params"], device)
+                            self._batch_state[gid] = _init_stacked_bufs(group["params"], device, self.state)
                         shape_groups, stacked_bufs, buf_indices = self._batch_state[gid]
 
                         for p in group["params"]:
@@ -292,8 +304,12 @@ class TritonMuonSRWithAuxAdam(Optimizer):
                                 raise RuntimeError("TritonMuonSRWithAuxAdam does not support sparse gradients")
 
                         if not hasattr(self, '_global_step'):
-                            self._global_step = 0
+                            self._global_step = _restore_global_step(
+                                self.state, [g for g in self.param_groups if g["use_muon"]])
                         self._global_step += 1
+                        # Recorded per param so that the SR seeds continue after load_state_dict().
+                        for p in group["params"]:
+                            self.state[p]["step"] = self._global_step
                         _triton_muon_batch_step(shape_groups, stacked_bufs, buf_indices,
                                                 beta, nesterov, ns_steps, lr, weight_decay,
                                                 self._global_step)
@@ -320,7 +336,7 @@ class TritonMuonSRWithAuxAdam(Optimizer):
                 eps          = group["eps"]
                 weight_decay = group["weight_decay"]
 
-                for p in group["params"]:
+                for i, p in enumerate(group["params"]):
                     assert p.dtype == torch.bfloat16, "only bfloat16 is supported."
                     if p.grad is None:
                         continue
@@ -337,6 +353,7 @@ class TritonMuonSRWithAuxAdam(Optimizer):
                         ema=state["ema"], ema_sq=state["ema_squared"],
                         lr=lr, beta1=beta1, beta2=beta2, eps=eps,
                         weight_decay=weight_decay, step=state["step"],
+                        param_idx=group_offset + i,
                     )
 
         return loss

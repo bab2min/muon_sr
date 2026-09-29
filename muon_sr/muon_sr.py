@@ -108,12 +108,16 @@ def _muon_step_fp32(grad, buf, p_fp32, beta, nesterov, ns_steps, lr, weight_deca
     p_fp32.add_(update, alpha=-lr)
 
 
-def _init_stacked_bufs(params, device):
+def _init_stacked_bufs(params, device, state):
     """
     Pre-allocate stacked BF16 momentum buffers grouped by original shape.
 
     Only momentum (BF16) is pre-allocated. FP32 workspace is allocated transiently
     during each step and freed immediately after, keeping persistent memory minimal.
+
+    `state[p]["momentum_buffer"]` is set to a view of the stacked buffer, so the momentum
+    is included in `state_dict()`. If `state` already holds a momentum buffer
+    (e.g. restored by `load_state_dict()`), it is copied into the stacked buffer.
 
     Returns:
       shape_groups : {shape: [param, ...]}
@@ -129,11 +133,28 @@ def _init_stacked_bufs(params, device):
 
     for shape, grp in shape_groups.items():
         N = len(grp)
-        stacked_bufs[shape] = torch.zeros(N, *shape, dtype=torch.bfloat16, device=device)
+        stacked = torch.zeros(N, *shape, dtype=torch.bfloat16, device=device)
         for i, p in enumerate(grp):
             buf_indices[id(p)] = i
+            p_state = state[p]
+            if "momentum_buffer" in p_state:
+                stacked[i].copy_(p_state["momentum_buffer"])
+            p_state["momentum_buffer"] = stacked[i]
+        stacked_bufs[shape] = stacked
 
     return dict(shape_groups), stacked_bufs, buf_indices
+
+
+class _StackedBufsMixin:
+    """
+    Makes `batch_ns=True` optimizers resumable. The stacked buffers and the global step
+    live outside of `self.state`, so they are rebuilt from the loaded state on the next step.
+    """
+
+    def load_state_dict(self, state_dict):
+        super().load_state_dict(state_dict)
+        self._batch_state = {}
+        self.__dict__.pop("_global_step", None)
 
 
 def _muon_batch_step(shape_groups, stacked_bufs, buf_indices,
@@ -209,7 +230,7 @@ def _muon_batch_step(shape_groups, stacked_bufs, buf_indices,
                 copy_stochastic_(p, p_fp32)
 
 
-class MuonSR(Optimizer):
+class MuonSR(_StackedBufsMixin, Optimizer):
     r"""
     Drop-in replacement for SingleDeviceMuon with BF16 parameters and stochastic rounding.
 
@@ -249,7 +270,7 @@ class MuonSR(Optimizer):
                 gid = id(group)
                 if gid not in self._batch_state:
                     device = group["params"][0].device
-                    self._batch_state[gid] = _init_stacked_bufs(group["params"], device)
+                    self._batch_state[gid] = _init_stacked_bufs(group["params"], device, self.state)
                 shape_groups, stacked_bufs, buf_indices = self._batch_state[gid]
 
                 for p in group["params"]:
@@ -280,7 +301,7 @@ class MuonSR(Optimizer):
         return loss
 
 
-class MuonSRWithAuxAdam(Optimizer):
+class MuonSRWithAuxAdam(_StackedBufsMixin, Optimizer):
     r"""
     Drop-in replacement for SingleDeviceMuonWithAuxAdam with BF16 parameters and stochastic rounding.
 
@@ -330,7 +351,7 @@ class MuonSRWithAuxAdam(Optimizer):
                     gid = id(group)
                     if gid not in self._batch_state:
                         device = group["params"][0].device
-                        self._batch_state[gid] = _init_stacked_bufs(group["params"], device)
+                        self._batch_state[gid] = _init_stacked_bufs(group["params"], device, self.state)
                     shape_groups, stacked_bufs, buf_indices = self._batch_state[gid]
 
                     for p in group["params"]:

@@ -83,6 +83,7 @@ def _adamw_step(
     eps: float,
     weight_decay: float,
     step: int,
+    param_idx: int,
 ):
     bias_correction = 1.0 - beta1 ** step
     bias_correction_sqrt = (1.0 - beta2 ** step) ** 0.5
@@ -91,8 +92,9 @@ def _adamw_step(
     BLOCK_SIZE = 1024
     grid = (triton.cdiv(n, BLOCK_SIZE),)
 
-    # different seed per (step, tensor) using storage address as part of the key
-    seed = (step * 2654435761 + p.data_ptr()) & 0xFFFFFFFF
+    # different seed per (step, tensor). The parameter index is used instead of the storage
+    # address so that the noise is the same across processes, e.g. when resuming from a checkpoint.
+    seed = (step * 2654435761 ^ param_idx * 1234567891) & 0xFFFFFFFF
 
     _adamw_kernel[grid](
         p,
@@ -148,14 +150,17 @@ class TritonAdamW(Optimizer):
         if closure is not None:
             loss = closure()
 
+        param_offset = 0
         for group in self.param_groups:
+            group_offset = param_offset
+            param_offset += len(group["params"])
             beta1, beta2 = group["betas"]
             lr = group["lr"]
             eps = group["eps"]
             weight_decay = group["weight_decay"]
             centralization = group["centralization"]
 
-            for p in group["params"]:
+            for i, p in enumerate(group["params"]):
                 assert p.dtype == torch.bfloat16, "only bfloat16 is supported."
                 if p.grad is None:
                     continue
@@ -192,6 +197,7 @@ class TritonAdamW(Optimizer):
                     eps=eps,
                     weight_decay=weight_decay,
                     step=state["step"],
+                    param_idx=group_offset + i,
                 )
 
         return loss

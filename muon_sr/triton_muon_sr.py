@@ -27,7 +27,8 @@ def _muon_prepare_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(0)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    # int64: a stacked group of large matrices (e.g. 7B MLP gate/up) exceeds 2^31 elements
+    offsets = pid.to(tl.int64) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_elements
 
     g   = tl.load(g_ptr  + offsets, mask=mask).to(tl.float32)
@@ -40,13 +41,13 @@ def _muon_prepare_kernel(
     else:
         update = new_buf
 
-    rand_buf = tl.randint(seed, offsets).to(tl.int32)
+    rand_buf = tl.randint(seed, offsets.to(tl.int32)).to(tl.int32)  # same SR noise as before below 2^31
     buf_i = new_buf.to(dtype=tl.int32, bitcast=True)
     buf_i = (buf_i + (rand_buf & 0xFFFF)) & -65536
     buf_rounded = buf_i.to(dtype=tl.float32, bitcast=True)
 
     tl.store(buf_ptr + offsets, buf_rounded.to(tl.bfloat16), mask=mask)
-    tl.store(out_ptr + offsets, update, mask=mask)
+    tl.store(out_ptr + offsets, update.to(out_ptr.dtype.element_ty), mask=mask)
 
 
 @triton.jit
@@ -55,21 +56,23 @@ def _muon_apply_kernel(
     update_ptr,
     lr,
     weight_decay,
+    scale,
     n_elements,
     seed,
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(0)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    # int64: a stacked group of large matrices (e.g. 7B MLP gate/up) exceeds 2^31 elements
+    offsets = pid.to(tl.int64) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_elements
 
     p      = tl.load(p_ptr      + offsets, mask=mask).to(tl.float32)
-    update = tl.load(update_ptr + offsets, mask=mask)
+    update = tl.load(update_ptr + offsets, mask=mask).to(tl.float32) * scale
 
     p = p * (1.0 - lr * weight_decay)
     p = p - lr * update
 
-    rand_p = tl.randint(seed, offsets).to(tl.int32)
+    rand_p = tl.randint(seed, offsets.to(tl.int32)).to(tl.int32)  # same SR noise as before below 2^31
     p_i = p.to(dtype=tl.int32, bitcast=True)
     p_i = (p_i + (rand_p & 0xFFFF)) & -65536
     p_rounded = p_i.to(dtype=tl.float32, bitcast=True)
@@ -83,10 +86,11 @@ def _deterministic_seed(step, param_idx, salt=0):
 
 
 def _run_prepare(p, grad, buf, beta, nesterov, step, param_idx):
-    """Momentum + Nesterov (Triton). Writes buf in-place (BF16 SR), returns FP32 pre-NS update."""
+    """Momentum + Nesterov (Triton). Writes buf in-place (BF16 SR), returns BF16 pre-NS update
+    (NS rounds its input to BF16 anyway, so an FP32 copy would only cost memory)."""
     n = p.numel()
     BLOCK_SIZE = 1024
-    update = torch.empty(n, dtype=torch.float32, device=p.device)
+    update = torch.empty(n, dtype=torch.bfloat16, device=p.device)
     _muon_prepare_kernel[(triton.cdiv(n, BLOCK_SIZE),)](
         grad.view(-1), buf.view(-1), update,
         beta, nesterov, n, _deterministic_seed(step, param_idx, salt=0), BLOCK_SIZE=BLOCK_SIZE,
@@ -94,33 +98,42 @@ def _run_prepare(p, grad, buf, beta, nesterov, step, param_idx):
     return update
 
 
+def _ns_scale(shape):
+    return max(1.0, shape[-2] / shape[-1]) ** 0.5
+
+
 def _run_apply(p, update_ns, lr, weight_decay, step, param_idx):
-    """Weight decay + param update (Triton), stochastic round p in-place (BF16)."""
+    """Weight decay + param update (Triton), stochastic round p in-place (BF16).
+    update_ns is the BF16 NS output; the shape scale is applied in FP32 inside the kernel."""
     n = p.numel()
     BLOCK_SIZE = 1024
     _muon_apply_kernel[(triton.cdiv(n, BLOCK_SIZE),)](
         p.view(-1), update_ns.reshape(-1),
-        lr, weight_decay, n, _deterministic_seed(step, param_idx, salt=1), BLOCK_SIZE=BLOCK_SIZE,
+        lr, weight_decay, _ns_scale(update_ns.shape), n, _deterministic_seed(step, param_idx, salt=1), BLOCK_SIZE=BLOCK_SIZE,
     )
 
 
 def _triton_muon_step(p, grad, buf, beta, nesterov, ns_steps, lr, weight_decay, step, param_idx):
     """Single-param Triton Muon step (no batching)."""
     update = _run_prepare(p, grad, buf, beta, nesterov, step, param_idx)
-    update_ns = _newton_schulz(update.view(p.shape), steps=ns_steps)
-    update_ns.mul_(max(1.0, update_ns.size(-2) / update_ns.size(-1)) ** 0.5)
+    update_ns = _newton_schulz(update.view(p.shape), steps=ns_steps, out_dtype=None)
     _run_apply(p, update_ns, lr, weight_decay, step, param_idx)
+
+
+# Max elements per batched Newton-Schulz call (256M BF16 = 512 MiB per temporary). Different chunkings can
+# differ in the last BF16 bit (batched GEMM), far below the stochastic rounding noise.
+NS_CHUNK_NUMEL = 1 << 28
 
 
 def _triton_muon_batch_step(shape_groups, stacked_bufs, buf_indices,
                             beta, nesterov, ns_steps, lr, weight_decay, step):
     """
     Batched Triton Muon step using pre-allocated stacked BF16 momentum buffers.
-    FP32 workspace is allocated transiently per shape group and freed after use.
+    BF16 workspace is allocated transiently per shape group and freed after use.
 
     Phase 1 (Triton): prepare on the full stacked buf/grad — 1 kernel launch per unique shape
-    Phase 2 (PyTorch): Newton-Schulz on stacked update    — 1 NS call per unique shape
-    Phase 3 (Triton): apply on stacked params             — 1 kernel launch per unique shape
+    Phase 2 (PyTorch): Newton-Schulz on stacked update    — 1 NS call per chunk of at most NS_CHUNK_NUMEL elements
+    Phase 3 (Triton): apply per param from the chunk's NS output
     """
     BLOCK_SIZE = 1024
     for shape_idx, (shape, grp_params) in enumerate(shape_groups.items()):
@@ -133,8 +146,8 @@ def _triton_muon_batch_step(shape_groups, stacked_bufs, buf_indices,
         all_active  = Na == len(grp_params)
 
         if all_active:
-            # Transient FP32 workspace — allocated here, freed at end of block
-            work = torch.empty(Na, *shape, dtype=torch.float32, device=active[0].device)
+            # Transient BF16 workspace (grads are BF16 and NS iterates in BF16) — freed at end of block
+            work = torch.empty(Na, *shape, dtype=torch.bfloat16, device=active[0].device)
             for p in active:
                 work[buf_indices[id(p)]].copy_(p.grad)
 
@@ -145,16 +158,17 @@ def _triton_muon_batch_step(shape_groups, stacked_bufs, buf_indices,
                 beta, nesterov, n, _deterministic_seed(step, shape_idx, salt=0), BLOCK_SIZE=BLOCK_SIZE,
             )
 
-            # Phase 2: NS operates on last two dims — pass stacked tensor directly
-            update_ns = _newton_schulz(work, steps=ns_steps)
-            rows, cols = work.size(-2), work.size(-1)
-            update_ns.mul_(max(1.0, rows / cols) ** 0.5)
-            del work  # free FP32 workspace before phase 3
-
-            # Phase 3: apply per-param using update_ns[i] views — no extra allocation
-            for p in active:
-                param_idx = shape_idx * 10000 + buf_indices[id(p)]
-                _run_apply(p, update_ns[buf_indices[id(p)]], lr, weight_decay, step, param_idx)
+            # Phase 2+3: NS on chunks of the stack (NS temporaries are as large as its input, so a whole stack of
+            # large matrices would need several stack-sized copies), then apply per-param from the chunk's views
+            by_index = {buf_indices[id(p)]: p for p in active}
+            k = max(1, NS_CHUNK_NUMEL // work[0].numel())
+            for start in range(0, Na, k):
+                update_ns = _newton_schulz(work[start:start + k], steps=ns_steps, out_dtype=None)
+                for j in range(update_ns.size(0)):
+                    i = start + j
+                    _run_apply(by_index[i], update_ns[j], lr, weight_decay, step, shape_idx * 10000 + i)
+                del update_ns
+            del work
 
         else:
             for p in active:

@@ -79,8 +79,9 @@ class SRAccumulator:
                 hooks.append(hook)
         return hooks
 
-def _newton_schulz(G: torch.Tensor, steps: int = 5) -> torch.Tensor:
-    """Newton-Schulz orthogonalization. Supports batched (ndim >= 2)."""
+def _newton_schulz(G: torch.Tensor, steps: int = 5, out_dtype=torch.float32) -> torch.Tensor:
+    """Newton-Schulz orthogonalization. Supports batched (ndim >= 2).
+    Iterates in BF16; out_dtype=None returns the BF16 result without an extra copy."""
     assert G.ndim >= 2
     a, b, c = 3.4445, -4.7750, 2.0315
     X = G.bfloat16()
@@ -94,7 +95,7 @@ def _newton_schulz(G: torch.Tensor, steps: int = 5) -> torch.Tensor:
         X = a * X + B @ X
     if transposed:
         X = X.mT
-    return X.to(torch.float32)
+    return X if out_dtype is None else X.to(out_dtype)
 
 
 def _muon_step_fp32(grad, buf, p_fp32, beta, nesterov, ns_steps, lr, weight_decay):

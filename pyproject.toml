@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "muon_sr"
 dynamic = ["version"]
-description = "A small utility for sr written in python"
+description = "A small utility for Muon Optimizer with Stochastic Rounding written in python"
 readme = "README.md"
 requires-python = ">=3.8"
 classifiers = [
